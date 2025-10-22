@@ -1,0 +1,28 @@
+# Guardrails in AWS Strands Agents
+
+## Purpose of Guardrails
+- Filter toxic or disallowed content before it reaches users.
+- Detect and redact sensitive data (PII, secrets).
+- Enforce domain-specific policies to keep agents on-topic and compliant.
+
+## Amazon Bedrock Integration
+- Configure `BedrockModel` with `guardrail_id`, `guardrail_version`, and processing mode (`sync` or `async`).
+- Input redaction is enabled by default (`guardrail_redact_input=True`); customize the replacement message via `guardrail_redact_input_message`.
+- Optional output redaction (`guardrail_redact_output`) prevents publishing unsafe completions.
+- Inspect guardrail interventions through `AgentResult.stop_reason == "guardrail_intervened"` and conversation history.
+
+## Notify-Only Guardrails
+- Use hooks (`HookProvider`, `HookRegistry`) to call Bedrock `ApplyGuardrail` in shadow mode.
+- Register callbacks on `MessageAddedEvent` and `AfterInvocationEvent` to log potential violations without blocking.
+- Ideal for soft launches and policy tuning before enforcing blocking behavior.
+
+## Working with Other Providers
+- Ollama and other providers lack native guardrails; emulate protections with:
+  - System prompts emphasizing allowed behavior.
+  - Tool-based filters or post-processing functions.
+  - Pattern matching and security audits.
+
+## Operational Tips
+- Maintain an inventory of guardrail policies and their violation thresholds.
+- Monitor guardrail intervention rates to adjust prompts or tooling.
+- Combine guardrails with logging, metrics, and security reviews for holistic risk management.

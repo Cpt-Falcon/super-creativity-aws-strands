@@ -1,0 +1,56 @@
+# AWS Strands Quickstart Essentials
+
+## Environment Setup
+- Requires Python 3.10 or newer.
+- Create and activate a virtual environment before installing dependencies.
+- Core dependencies: `strands-agents`, plus optional development helpers `strands-agents-tools` and `strands-agents-builder`.
+
+## Installing the SDK with uv (recommended)
+1. `uv venv` to create an isolated environment.
+2. `uv pip install strands-agents strands-agents-tools strands-agents-builder`.
+3. Keep `uv` available for running examples: `uv run python my_agent/agent.py`.
+
+## Project Skeleton
+```
+my_agent/
+├── __init__.py
+├── agent.py
+└── requirements.txt
+```
+- `requirements.txt` pins the SDK and community tool packages.
+- `agent.py` is the entry point where the agent, tools, and prompts live.
+
+## Authoring an Agent
+- Import from `strands` and `strands_tools` to compose agents.
+- Define reusable tools with the `@tool` decorator (pure Python functions).
+- Instantiate `Agent(tools=[...])` and invoke it with natural language.
+- Agent responses return an `AgentResult` containing messages, metrics, and traces.
+
+## Running Agents
+- Run synchronously: `uv run python -u my_agent/agent.py`.
+- For async workflows use `Agent.stream_async()` and iterate events to stream deltas.
+- Suppress console streaming by providing `callback_handler=None`.
+
+## Monitoring Agent Behavior
+- `AgentResult.metrics.get_summary()` surfaces latency, token usage, and per-tool stats.
+- Traces provide lifecycle insight; integrate with OpenTelemetry for centralized analysis.
+- Debug logging: configure the `strands` logger with `logging.basicConfig` and set level to `DEBUG`.
+
+## Model Selection
+- Default provider is Amazon Bedrock with Claude 4 Sonnet.
+- Override via `Agent(model="anthropic.claude-sonnet-4-20250514-v1:0")` or pass a `BedrockModel` instance for fine control (temperature, region, stop sequences).
+- Additional providers: Anthropic direct, LiteLLM, LlamaAPI, Mistral, Ollama, OpenAI, Cohere, Writer, custom adapters.
+
+## Credential Configuration
+- Provide AWS credentials with permission to invoke Bedrock models.
+- Options include environment variables, `aws configure`, IAM roles, or Bedrock bearer tokens.
+- Ensure desired models are enabled in the Bedrock console.
+
+## Streaming & Events
+- Streaming yields incremental data, tool usage updates, and lifecycle notifications.
+- Async iterators are recommended for FastAPI/Django Channels integrations.
+- Custom callback handlers can route events to logs, dashboards, or persistent storage.
+
+## Next-Step Resources
+- Explore multi-agent patterns, conversation state, observability, and deployment guides.
+- Use the community `strands-agents-tools` library to extend functionality quickly.

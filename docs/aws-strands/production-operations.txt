@@ -1,0 +1,37 @@
+# Operating AWS Strands Agents in Production
+
+## Production Configuration Checklist
+- Instantiate agents with explicit configuration: model, region, temperature, stop sequences.
+- Hard-code the tool list for deterministic behavior; skip automatic discovery in production.
+- Scope IAM permissions to required Bedrock model ARNs and tool resources.
+
+## Security Considerations
+- Apply least privilege to custom tools and downstream services.
+- Validate and sanitize all inbound user input before forwarding to the agent.
+- Consider guardrails or policy hooks for automated filtering of sensitive topics.
+
+## Performance Optimization
+- Use conversation managers (e.g. `SlidingWindowConversationManager`) to bound context size.
+- Prefer streaming responses (`stream_async`) to reduce perceived latency.
+- Instrument agent invocations with metrics and traces to identify slow tools or loops.
+
+## Error Handling Strategy
+- Wrap agent calls in try/except blocks; log root causes and propagate actionable errors.
+- Implement fallback flows when tools fail (e.g., retry with adjusted parameters or surface user guidance).
+- Monitor error rates to trigger alerts and automated remediation.
+
+## Deployment Patterns on AWS
+- **Bedrock AgentCore**: Managed, serverless runtime purpose-built for agent orchestration.
+- **AWS Lambda**: Ideal for bursty, short-lived workloads; watch execution time limits.
+- **AWS Fargate / Amazon EKS**: Containerized deployments with streaming support for interactive apps.
+- **Amazon EC2**: Maximum control for high-throughput or specialized infrastructure.
+
+## Monitoring & Observability
+- Track tool execution stats (latency, error rate), token usage, and overall response times.
+- Integrate with CloudWatch or OpenTelemetry collectors to centralize metrics and logs.
+- Define Service Level Objectives (SLOs) for latency and success rate; alert on deviations.
+
+## Operational Playbook
+- Automate configuration management for model IDs, guardrails, and tool registries.
+- Regularly audit tool usage and prune unused capabilities to reduce attack surface.
+- Establish deployment pipelines with automated tests (unit, integration, load) before promoting changes.

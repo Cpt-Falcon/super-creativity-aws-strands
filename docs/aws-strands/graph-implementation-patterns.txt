@@ -1,0 +1,709 @@
+# Graph Construction: Real-World Implementation Patterns
+
+This supplementary guide provides ready-to-use code patterns and architectural templates for common graph scenarios in AWS Strands production environments.
+
+---
+
+## PATTERN 1: Multi-Iteration Loop with Convergence
+
+**Use case:** Process data through multiple refinement iterations, then aggregate results.
+
+**Architecture:**
+```
+iteration_controller (entry) 
+  ↓ (should_continue)
+chaos_generator
+  ↓
+creative_agent (model A, high temp)
+  ↓
+refinement_agent (model A, low temp)
+  ↓
+judge_node (evaluate ideas)
+  ↓ (loop back)
+iteration_controller
+  ↓ (is_complete)
+deep_research (final aggregation)
+```
+
+**Implementation:**
+
+```python
+from pydantic import BaseModel
+from strands.multiagent import GraphBuilder
+from typing import Dict, Any
+
+class IterationState(BaseModel):
+    """Track loop state across multiple iterations."""
+    current_iteration: int = 0
+    max_iterations: int = 3
+    ideas_per_iteration: list[str] = []
+    selected_ideas: list[str] = []
+
+class IterationControllerNode:
+    def __init__(self, shared_state: IterationState):
+        self.shared_state = shared_state
+        self.name = "iteration_controller"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        current = self.shared_state.current_iteration
+        max_iters = self.shared_state.max_iterations
+        
+        should_continue = current < max_iters
+        
+        msg = f"Iteration {current}/{max_iters}: {'Continuing' if should_continue else 'Complete'}"
+        
+        if should_continue:
+            self.shared_state.current_iteration += 1
+        
+        return {
+            "message": msg,
+            "should_continue": should_continue,
+            "iteration": current
+        }
+
+class CreativeAgentNode:
+    def __init__(self, shared_state: IterationState, agent):
+        self.shared_state = shared_state
+        self.agent = agent
+        self.name = "creative_agent"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        iteration = self.shared_state.current_iteration - 1  # Already incremented
+        
+        prompt = f"""Generate creative ideas for: {task}
+        Iteration {iteration + 1}
+        Previous ideas (context): {self.shared_state.ideas_per_iteration}"""
+        
+        result = await self.agent.invoke_async(prompt)
+        
+        # Store ideas for next iteration
+        ideas = self._extract_ideas(result)
+        self.shared_state.ideas_per_iteration = ideas
+        
+        return {
+            "message": f"Generated {len(ideas)} ideas",
+            "ideas": ideas
+        }
+
+class RefinementAgentNode:
+    def __init__(self, shared_state: IterationState, agent):
+        self.shared_state = shared_state
+        self.agent = agent
+        self.name = "refinement_agent"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        ideas = self.shared_state.ideas_per_iteration
+        
+        prompt = f"Refine and rank these ideas:\n" + "\n".join(ideas)
+        
+        result = await self.agent.invoke_async(prompt)
+        refined = self._parse_refinements(result)
+        
+        return {"message": f"Refined {len(refined)} ideas", "refined": refined}
+
+class FinalAggregationNode:
+    def __init__(self, shared_state: IterationState):
+        self.shared_state = shared_state
+        self.name = "final_aggregation"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        all_ideas = self.shared_state.ideas_per_iteration
+        best = self.shared_state.selected_ideas
+        
+        summary = f"""
+        FINAL RESULTS AFTER {self.shared_state.current_iteration} ITERATIONS
+        
+        Total ideas explored: {len(all_ideas)}
+        Selected ideas: {len(best)}
+        
+        Top ideas:
+        {chr(10).join(f'- {idea}' for idea in best)}
+        """
+        
+        return {"message": summary}
+
+# Build the graph
+def build_iterative_graph(config, shared_state):
+    builder = GraphBuilder()
+    
+    controller = IterationControllerNode(shared_state)
+    creative = CreativeAgentNode(shared_state, config.creative_agent)
+    refiner = RefinementAgentNode(shared_state, config.refinement_agent)
+    final = FinalAggregationNode(shared_state)
+    
+    builder.add_node(controller, "controller")
+    builder.add_node(creative, "creative")
+    builder.add_node(refiner, "refiner")
+    builder.add_node(final, "final")
+    
+    builder.set_entry_point("controller")
+    
+    # Condition: continue if iterations remain
+    def should_continue(state):
+        return shared_state.current_iteration < shared_state.max_iterations
+    
+    # Condition: done if max iterations reached
+    def is_done(state):
+        return shared_state.current_iteration >= shared_state.max_iterations
+    
+    builder.add_edge("controller", "creative", condition=should_continue)
+    builder.add_edge("controller", "final", condition=is_done)
+    builder.add_edge("creative", "refiner")
+    builder.add_edge("refiner", "controller")  # Loop back
+    
+    builder.set_max_node_executions(config.iterations * 4 + 5)
+    builder.reset_on_revisit(False)
+    
+    return builder.build()
+
+# Usage
+shared_state = IterationState(max_iterations=3)
+graph = build_iterative_graph(config, shared_state)
+result = graph.run("Innovate in healthcare")
+```
+
+---
+
+## PATTERN 2: Parallel Model Chains with Independent Judges
+
+**Use case:** Run the same task through multiple LLM models in parallel, each with its own judge, then aggregate.
+
+**Architecture:**
+```
+                         ┌─ Model_A_Creative ─ Model_A_Refinement ─ Model_A_Judge ┐
+entry ─ coordinator ─────┤─ Model_B_Creative ─ Model_B_Refinement ─ Model_B_Judge ├─ aggregator
+                         └─ Model_C_Creative ─ Model_C_Refinement ─ Model_C_Judge ┘
+```
+
+**Implementation:**
+
+```python
+class ParallelState(BaseModel):
+    """State for multi-model execution."""
+    models: list[str] = ["model_a", "model_b", "model_c"]
+    results_by_model: Dict[str, Dict[str, Any]] = {}
+    consensus_ideas: list[str] = []
+
+class CoordinatorNode:
+    def __init__(self, shared_state: ParallelState):
+        self.shared_state = shared_state
+        self.name = "coordinator"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        return {"message": f"Coordinating {len(self.shared_state.models)} models", "task": task}
+
+class ModelCreativeNode:
+    def __init__(self, shared_state: ParallelState, model_key: str, agent):
+        self.shared_state = shared_state
+        self.model_key = model_key
+        self.agent = agent
+        self.name = f"{model_key}_creative"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Each model gets the same task
+        result = await self.agent.invoke_async(task)
+        
+        # Store result keyed by model
+        if self.model_key not in self.shared_state.results_by_model:
+            self.shared_state.results_by_model[self.model_key] = {}
+        
+        self.shared_state.results_by_model[self.model_key]["creative"] = result
+        
+        return {"message": f"{self.model_key} creative complete", "result": result}
+
+class ModelRefinementNode:
+    def __init__(self, shared_state: ParallelState, model_key: str, agent):
+        self.shared_state = shared_state
+        self.model_key = model_key
+        self.agent = agent
+        self.name = f"{model_key}_refinement"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        creative_result = self.shared_state.results_by_model[self.model_key]["creative"]
+        
+        result = await self.agent.invoke_async(f"Refine: {creative_result}")
+        
+        self.shared_state.results_by_model[self.model_key]["refinement"] = result
+        
+        return {"message": f"{self.model_key} refinement complete", "result": result}
+
+class ModelJudgeNode:
+    def __init__(self, shared_state: ParallelState, model_key: str, judge):
+        self.shared_state = shared_state
+        self.model_key = model_key
+        self.judge = judge
+        self.name = f"{model_key}_judge"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        refined = self.shared_state.results_by_model[self.model_key]["refinement"]
+        
+        # Judge evaluates the refined output
+        evaluation = await self.judge.evaluate(refined)
+        
+        self.shared_state.results_by_model[self.model_key]["evaluation"] = evaluation
+        
+        return {"message": f"{self.model_key} judge complete", "evaluation": evaluation}
+
+class AggregatorNode:
+    def __init__(self, shared_state: ParallelState):
+        self.shared_state = shared_state
+        self.name = "aggregator"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Analyze results from all models
+        all_evaluations = [
+            v.get("evaluation") 
+            for v in self.shared_state.results_by_model.values()
+        ]
+        
+        # Find consensus ideas (ideas mentioned by multiple models)
+        self.shared_state.consensus_ideas = self._find_consensus(all_evaluations)
+        
+        summary = f"""
+        PARALLEL MODEL EXECUTION COMPLETE
+        
+        Models executed: {len(self.shared_state.models)}
+        Consensus ideas: {len(self.shared_state.consensus_ideas)}
+        
+        Top consensus ideas:
+        {chr(10).join(self.shared_state.consensus_ideas[:3])}
+        """
+        
+        return {"message": summary}
+
+# Build the graph
+def build_parallel_graph(config, shared_state):
+    builder = GraphBuilder()
+    
+    coordinator = CoordinatorNode(shared_state)
+    aggregator = AggregatorNode(shared_state)
+    
+    builder.add_node(coordinator, "coordinator")
+    builder.add_node(aggregator, "aggregator")
+    builder.set_entry_point("coordinator")
+    
+    # Create nodes for each model
+    for model_key in shared_state.models:
+        creative = ModelCreativeNode(shared_state, model_key, config.agents[model_key])
+        refiner = ModelRefinementNode(shared_state, model_key, config.agents[model_key])
+        judge = ModelJudgeNode(shared_state, model_key, config.judges[model_key])
+        
+        builder.add_node(creative, f"{model_key}_creative")
+        builder.add_node(refiner, f"{model_key}_refinement")
+        builder.add_node(judge, f"{model_key}_judge")
+        
+        # Chain for this model
+        builder.add_edge("coordinator", f"{model_key}_creative")
+        builder.add_edge(f"{model_key}_creative", f"{model_key}_refinement")
+        builder.add_edge(f"{model_key}_refinement", f"{model_key}_judge")
+        builder.add_edge(f"{model_key}_judge", "aggregator")
+    
+    builder.set_max_node_executions(len(shared_state.models) * 4 + 5)
+    
+    return builder.build()
+
+# Usage
+shared_state = ParallelState()
+graph = build_parallel_graph(config, shared_state)
+result = graph.run("Propose a novel business model")
+```
+
+---
+
+## PATTERN 3: Conditional Branching (High vs Low Confidence Paths)
+
+**Use case:** Route based on classifier confidence; high-confidence paths are fast, low-confidence paths get extra verification.
+
+**Architecture:**
+```
+classifier
+  ├─ (confidence > 0.8) ─ fast_path ─┐
+  └─ (confidence <= 0.8) ─ verify_path ┴─ merge
+```
+
+**Implementation:**
+
+```python
+class BranchingState(BaseModel):
+    """State for branching logic."""
+    classification: Dict[str, Any] = {}
+    confidence: float = 0.0
+    fast_path_result: str = ""
+    verify_path_result: str = ""
+
+class ClassifierNode:
+    def __init__(self, shared_state: BranchingState, classifier_agent):
+        self.shared_state = shared_state
+        self.classifier_agent = classifier_agent
+        self.name = "classifier"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        result = await self.classifier_agent.classify(task)
+        
+        self.shared_state.classification = result
+        self.shared_state.confidence = result.get("confidence", 0.0)
+        
+        return {
+            "message": f"Classification: {result['category']} (confidence: {result['confidence']:.2f})",
+            "classification": result
+        }
+
+class FastPathNode:
+    """For high-confidence results."""
+    def __init__(self, shared_state: BranchingState):
+        self.shared_state = shared_state
+        self.name = "fast_path"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Quick processing for high-confidence
+        result = f"Fast-processed: {self.shared_state.classification['category']}"
+        self.shared_state.fast_path_result = result
+        
+        return {"message": result, "path": "fast"}
+
+class VerifyPathNode:
+    """For low-confidence results; apply extra validation."""
+    def __init__(self, shared_state: BranchingState, verifier_agent):
+        self.shared_state = shared_state
+        self.verifier_agent = verifier_agent
+        self.name = "verify_path"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Extra verification for low-confidence
+        verification = await self.verifier_agent.verify(
+            self.shared_state.classification
+        )
+        
+        result = f"Verified: {verification['result']}"
+        self.shared_state.verify_path_result = result
+        
+        return {"message": result, "path": "verify"}
+
+class MergeNode:
+    """Combine results from both paths."""
+    def __init__(self, shared_state: BranchingState):
+        self.shared_state = shared_state
+        self.name = "merge"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        final_result = self.shared_state.fast_path_result or self.shared_state.verify_path_result
+        
+        return {
+            "message": f"Merged result: {final_result}",
+            "final": final_result,
+            "confidence": self.shared_state.confidence
+        }
+
+# Build the graph
+def build_branching_graph(config, shared_state):
+    builder = GraphBuilder()
+    
+    classifier = ClassifierNode(shared_state, config.classifier)
+    fast = FastPathNode(shared_state)
+    verify = VerifyPathNode(shared_state, config.verifier)
+    merge = MergeNode(shared_state)
+    
+    builder.add_node(classifier, "classifier")
+    builder.add_node(fast, "fast_path")
+    builder.add_node(verify, "verify_path")
+    builder.add_node(merge, "merge")
+    
+    builder.set_entry_point("classifier")
+    
+    # Condition functions
+    def high_confidence(state):
+        return shared_state.confidence > 0.8
+    
+    def low_confidence(state):
+        return shared_state.confidence <= 0.8
+    
+    builder.add_edge("classifier", "fast_path", condition=high_confidence)
+    builder.add_edge("classifier", "verify_path", condition=low_confidence)
+    builder.add_edge("fast_path", "merge")
+    builder.add_edge("verify_path", "merge")
+    
+    return builder.build()
+
+# Usage
+shared_state = BranchingState()
+graph = build_branching_graph(config, shared_state)
+result = graph.run("Classify this text")
+```
+
+---
+
+## PATTERN 4: Error Recovery with Fallback Nodes
+
+**Use case:** Primary node fails; fallback node handles gracefully.
+
+**Architecture:**
+```
+primary_node
+  ├─ (success) ─ next_node
+  └─ (error) ─ fallback_node ─ next_node
+```
+
+**Implementation:**
+
+```python
+class ErrorRecoveryState(BaseModel):
+    """Track error and recovery state."""
+    primary_error: Optional[str] = None
+    fallback_used: bool = False
+    result: str = ""
+
+class PrimaryNode:
+    def __init__(self, shared_state: ErrorRecoveryState):
+        self.shared_state = shared_state
+        self.name = "primary"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        try:
+            # Primary logic (might fail)
+            if "error" in task.lower():
+                raise ValueError("Primary node failure")
+            
+            result = f"Primary result: {task}"
+            self.shared_state.result = result
+            
+            return {"message": result, "success": True}
+        
+        except Exception as e:
+            self.shared_state.primary_error = str(e)
+            # Don't propagate; let graph routing handle it
+            return {"message": f"Error: {e}", "success": False}
+
+class FallbackNode:
+    def __init__(self, shared_state: ErrorRecoveryState):
+        self.shared_state = shared_state
+        self.name = "fallback"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Handle the error from primary
+        error_msg = self.shared_state.primary_error
+        
+        result = f"Fallback handling error: {error_msg}"
+        self.shared_state.result = result
+        self.shared_state.fallback_used = True
+        
+        return {"message": result, "success": True}
+
+class NextNode:
+    def __init__(self, shared_state: ErrorRecoveryState):
+        self.shared_state = shared_state
+        self.name = "next"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        path = "fallback" if self.shared_state.fallback_used else "primary"
+        
+        return {
+            "message": f"Proceeding with {path} result: {self.shared_state.result}",
+            "final_result": self.shared_state.result
+        }
+
+# Build the graph
+def build_error_recovery_graph(config, shared_state):
+    builder = GraphBuilder()
+    
+    primary = PrimaryNode(shared_state)
+    fallback = FallbackNode(shared_state)
+    next_node = NextNode(shared_state)
+    
+    builder.add_node(primary, "primary")
+    builder.add_node(fallback, "fallback")
+    builder.add_node(next_node, "next")
+    
+    builder.set_entry_point("primary")
+    
+    # Condition: if primary succeeded, skip fallback
+    def primary_succeeded(state):
+        return shared_state.primary_error is None
+    
+    # Condition: if primary failed, use fallback
+    def primary_failed(state):
+        return shared_state.primary_error is not None
+    
+    builder.add_edge("primary", "next", condition=primary_succeeded)
+    builder.add_edge("primary", "fallback", condition=primary_failed)
+    builder.add_edge("fallback", "next")
+    
+    return builder.build()
+
+# Usage
+shared_state = ErrorRecoveryState()
+graph = build_error_recovery_graph(config, shared_state)
+result = graph.run("Process this data")
+```
+
+---
+
+## PATTERN 5: Resource-Pooled Worker Nodes
+
+**Use case:** Distribute work across a pool of identical worker nodes efficiently.
+
+**Architecture:**
+```
+distributor ─┬─ worker_1 ─┐
+             ├─ worker_2 ─┤
+             ├─ worker_3 ─┼─ aggregator
+             └─ worker_N ─┘
+```
+
+**Implementation:**
+
+```python
+from dataclasses import dataclass
+
+class WorkerPoolState(BaseModel):
+    """Manage work distribution across worker pool."""
+    tasks: list[str] = []
+    worker_results: Dict[int, Any] = {}
+    aggregated_result: str = ""
+
+class DistributorNode:
+    def __init__(self, shared_state: WorkerPoolState, num_workers: int):
+        self.shared_state = shared_state
+        self.num_workers = num_workers
+        self.name = "distributor"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Split task into chunks for workers
+        task_list = self._split_task(task, self.num_workers)
+        self.shared_state.tasks = task_list
+        
+        return {
+            "message": f"Distributing {len(task_list)} tasks to {self.num_workers} workers",
+            "tasks": task_list
+        }
+    
+    def _split_task(self, task: str, num_workers: int) -> list[str]:
+        """Split a task into subtasks for workers."""
+        # Simple split; in production, use intelligent partitioning
+        words = task.split()
+        chunk_size = max(1, len(words) // num_workers)
+        
+        tasks = []
+        for i in range(0, len(words), chunk_size):
+            chunk = " ".join(words[i:i+chunk_size])
+            tasks.append(chunk)
+        
+        return tasks[:num_workers]  # Limit to num_workers
+
+class WorkerNode:
+    def __init__(self, shared_state: WorkerPoolState, worker_id: int):
+        self.shared_state = shared_state
+        self.worker_id = worker_id
+        self.name = f"worker_{worker_id}"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Get assigned task for this worker
+        if self.worker_id < len(self.shared_state.tasks):
+            assigned_task = self.shared_state.tasks[self.worker_id]
+        else:
+            assigned_task = ""
+        
+        # Process
+        result = f"Worker {self.worker_id} processed: {assigned_task[:50]}..."
+        
+        # Store result
+        self.shared_state.worker_results[self.worker_id] = result
+        
+        return {"message": result}
+
+class AggregatorNode:
+    def __init__(self, shared_state: WorkerPoolState):
+        self.shared_state = shared_state
+        self.name = "aggregator"
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Combine results from all workers
+        all_results = [
+            self.shared_state.worker_results.get(i, "")
+            for i in range(len(self.shared_state.tasks))
+        ]
+        
+        final_result = " | ".join(filter(None, all_results))
+        self.shared_state.aggregated_result = final_result
+        
+        return {
+            "message": f"Aggregated results from {len(all_results)} workers",
+            "final_result": final_result
+        }
+
+# Build the graph
+def build_worker_pool_graph(config, shared_state, num_workers=4):
+    builder = GraphBuilder()
+    
+    distributor = DistributorNode(shared_state, num_workers)
+    aggregator = AggregatorNode(shared_state)
+    
+    builder.add_node(distributor, "distributor")
+    builder.add_node(aggregator, "aggregator")
+    builder.set_entry_point("distributor")
+    
+    # Create worker pool
+    for i in range(num_workers):
+        worker = WorkerNode(shared_state, i)
+        builder.add_node(worker, f"worker_{i}")
+        
+        # Wire: distributor → workers → aggregator
+        builder.add_edge("distributor", f"worker_{i}")
+        builder.add_edge(f"worker_{i}", "aggregator")
+    
+    builder.set_max_node_executions(num_workers + 2)
+    
+    return builder.build()
+
+# Usage
+shared_state = WorkerPoolState()
+graph = build_worker_pool_graph(config, shared_state, num_workers=4)
+result = graph.run("Process this large dataset")
+```
+
+---
+
+## Debugging Tips for Production Graphs
+
+### Tip 1: Log Shared State at Key Points
+
+```python
+def log_shared_state(shared_state, context: str):
+    """Helper to dump shared state for debugging."""
+    state_dict = shared_state.model_dump()
+    logger.info(f"[{context}] SharedState: {state_dict}")
+```
+
+### Tip 2: Instrument Condition Functions
+
+```python
+def traced_condition(state, condition_name: str):
+    """Wrap condition function with logging."""
+    result = True  # Your condition logic
+    logger.debug(f"Condition '{condition_name}' evaluated to {result}")
+    return result
+```
+
+### Tip 3: Record Execution Timeline
+
+```python
+class ExecutionTimeline:
+    def __init__(self):
+        self.events = []
+    
+    def record(self, node_name: str, event: str):
+        self.events.append({
+            "timestamp": time.time(),
+            "node": node_name,
+            "event": event
+        })
+    
+    def summary(self):
+        for evt in self.events:
+            print(f"{evt['timestamp']}: {evt['node']} - {evt['event']}")
+```
+
+---
+
+## Conclusion
+
+These patterns form the foundation for building complex, production-grade graphs in AWS Strands. Adapt them to your use case, add comprehensive logging, and test thoroughly with various input scenarios before deploying to production.

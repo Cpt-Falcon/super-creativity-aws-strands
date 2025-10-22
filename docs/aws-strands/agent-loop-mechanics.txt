@@ -1,0 +1,34 @@
+# AWS Strands Agent Loop Mechanics
+
+## Concept Overview
+- The agent loop is the control cycle that ingests input, plans tool use, executes calls, and delivers responses.
+- Each iteration may recurse until the model achieves a stop reason (final answer, tool failure, max tokens, etc.).
+
+## Core Components
+- **Event loop cycle**: Orchestrates language model calls, tool resolution, retry logic, and telemetry capture.
+- **Message pipeline**: User prompts, assistant replies, and tool results are normalized and persisted in session state.
+- **Tool execution layer**: Validates requests, invokes registered Python tools, and feeds structured results back to the model.
+- **Metrics & traces**: Every cycle produces span-level detail for debugging and optimization.
+
+## Step-by-Step Flow
+1. **Initialization** – Build an `Agent` with tools, optional system prompt, conversation manager, and observability hooks.
+2. **Input handling** – User content is appended to history and evaluated by the conversation manager before model invocation.
+3. **Model reasoning** – The LLM receives system prompt, history, tool schemas, and generates next actions.
+4. **Tool dispatch** – Tool requests are parsed, validated, executed, and converted into `toolResult` messages.
+5. **Recursive reasoning** – The updated context is fed back into the loop; processing continues until a stop condition is reached.
+6. **Completion** – Final assistant text plus telemetry is returned via `AgentResult`.
+
+## Error Handling
+- Exponential backoff is baked into the loop for transient tool or model errors.
+- `MaxTokensReachedException` signals an unrecoverable state; address by raising token limits or simplifying tool schemas.
+- Design tools with concise JSON schemas to avoid excessive token usage.
+
+## Instrumentation Tips
+- Inspect `AgentResult.metrics` for loop counts, tool latencies, and token consumption.
+- Enable OpenTelemetry export to visualize spans representing model calls and tool use.
+- Guardrails integrate at the tool validation stage to enforce policy before execution completes.
+
+## Design Recommendations
+- Keep tools focused and deterministic to simplify decision making.
+- Provide system prompts that clarify tool usage patterns and guard against runaway recursion.
+- Use conversation managers (sliding window, summary) to control context size in long interactions.

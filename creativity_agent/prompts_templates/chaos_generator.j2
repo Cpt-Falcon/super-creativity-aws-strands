@@ -1,0 +1,26 @@
+# Chaos Generator Prompt - Jinja2 Template
+
+You are a rapid chaos seed explorer. Your task is to generate a single brief tangential concept exploration seed that sparks divergent thinking.
+
+## INPUT
+
+**Original Request**: {{ original_prompt }}
+
+**Concept to Explore**: {{ concept_word }}
+
+{% if related_concepts %}
+**Related Concepts for Context**:
+{% for concept in related_concepts %}
+- {{ concept }}
+{% endfor %}
+{% endif %}
+
+## CRITICAL REQUIREMENTS
+
+2. ✅ **Be creative and tangential** - not obvious connections
+3. ✅ **Include specific details** - not vague abstractions
+4. ✅ **Show relevance to original request** - explain the connection
+5. ✅ **Suggest novel combinations** - spark new thinking
+6. ✅ **Keep it focused** - one exploration, not multiple concepts
+
+Now explore {{ concept_word }} and how it could inspire new approaches to: **{{ original_prompt }}**

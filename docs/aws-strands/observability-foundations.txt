@@ -1,0 +1,30 @@
+# Observability Foundations for AWS Strands Agents
+
+## Why Observability Matters
+- Enables engineers to inspect model reasoning, tool use, and runtime health.
+- Supports continuous improvement loops that combine product telemetry with qualitative feedback.
+
+## Telemetry Primitives
+- **Traces**: End-to-end spans detailing model invocations, tool executions, prompts, and token counts.
+- **Metrics**: Numeric signals such as latency, loop counts, token consumption, tool success rate, retention metrics.
+- **Logs**: Structured or semi-structured records for debugging; can capture streamed text or policy decisions.
+
+## Embedded Capabilities
+- The Strands SDK emits metrics, traces, and logs without additional middleware.
+- Integrate with OpenTelemetry collectors to route data to CloudWatch, Datadog, or other observability backends.
+
+## End-to-End Framework
+1. Engineer agents with built-in instrumentation.
+2. Route telemetry to data warehouses for long-term analysis and cost tracking.
+3. Feed insights back into research and product experimentation.
+
+## Best Practices
+- Standardize on OpenTelemetry schemas for interoperability.
+- Implement data fan-out: one pipeline for real-time alerting, another for analytics.
+- Filter sensitive or large payloads; redact PII and enforce retention policies.
+- Treat observability as a first-class requirement in development sprints (“shift left”).
+
+## Getting Started
+- Enable Strands telemetry exports and confirm spans capture model parameters.
+- Track cache metrics (`CacheReadInputTokens`, `CacheWriteInputTokens`) to evaluate prompt caching.
+- Build dashboards for token spend, tool error rates, latency percentiles, and guardrail interventions.

@@ -1,0 +1,62 @@
+{
+  "iterations": 1,
+  "models": {
+    "A": {
+      "model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "high_temp": 1,
+      "low_temp": 0.1,
+      "streaming": false
+    },
+    "B": {
+      "model_id": "us.amazon.nova-pro-v1:0",
+      "high_temp": 1,
+      "low_temp": 0.2,
+      "streaming": false
+    }
+  },
+  "chaos_generator": {
+    "model_id": "us.amazon.nova-premier-v1:0",
+    "temperature": 0.5,
+    "max_web_searches": 2,
+    "timeout_per_seed": 10,
+    "streaming": true
+  },
+  "judge": {
+    "model_id": "us.anthropic.claude-haiku-4-5-20251001-v1:0",
+    "temperature": 0.1,
+    "timeout": 30,
+    "streaming": true
+  },
+  "steps": [
+    {
+      "id": "ah",
+      "model": "A",
+      "temperature": "high",
+      "prompt_file": "creative_agent.txt",
+      "next": "al"
+    },
+    {
+      "id": "al",
+      "model": "A", 
+      "temperature": "low",
+      "prompt_file": "refinement_agent.txt",
+      "next": "bh"
+    },
+    {
+      "id": "bh",
+      "model": "B",
+      "temperature": "high", 
+      "prompt_file": "creative_agent.txt",
+      "next": "bl"
+    },
+    {
+      "id": "bl",
+      "model": "B",
+      "temperature": "low",
+      "prompt_file": "refinement_agent.txt",
+      "next": "loop"
+    }
+  ],
+  "loop_back_to": "ah",
+  "final_step": "bl"
+}

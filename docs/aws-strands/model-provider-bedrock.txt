@@ -1,0 +1,49 @@
+# Amazon Bedrock Model Provider for Strands
+
+## Capabilities
+- Unified access to Claude, Nova, Llama, and other Bedrock-hosted models.
+- Supports text, multimodal inputs, tool calling, guardrails, and prompt caching.
+
+## Prerequisites
+- AWS account with Bedrock access.
+- IAM permissions: `bedrock:InvokeModel` and `bedrock:InvokeModelWithResponseStream`.
+- Request model access in the Bedrock console; ensure the target region supports the chosen model family.
+
+## Credential Setup
+- Recommended: configure with `uv run aws configure` or set `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, and `AWS_REGION`.
+- Advanced: supply a custom `boto3.Session` to `BedrockModel` for fine-grained control.
+
+## Basic Usage
+- Default agent: `agent = Agent()` creates a `BedrockModel` targeting Claude 4 Sonnet.
+- Explicit model string: `Agent(model="anthropic.claude-sonnet-4-20250514-v1:0")`.
+- Rich configuration:
+  ```python
+  bedrock_model = BedrockModel(
+      model_id="us.amazon.nova-premier-v1:0",
+      region_name="us-east-1",
+      temperature=0.3,
+      top_p=0.8,
+      streaming=True,
+  )
+  agent = Agent(model=bedrock_model)
+  ```
+
+## Configuration Options
+- Adjustable parameters include `max_tokens`, `stop_sequences`, `additional_request_fields`, and guardrail settings.
+- Prompt caching: set `cache_prompt="default"` on the model; inspect cache metrics via `AgentResult.metrics`.
+- Tool caching: set `cache_tools="default"` when using community or custom tools.
+- Message caching: insert `{"cachePoint": {"type": "default"}}` blocks in the message list.
+
+## Advanced Features
+- **Streaming toggle**: `streaming=False` enables models that only support batch inference.
+- **Multimodal input**: supply `document` blocks alongside `text` blocks in the message payload.
+- **Guardrails**: configure Bedrock guardrails for blocking or redaction behavior.
+- **Runtime updates**: call `agent.model.update_config()` from tools to adjust temperature, model_id, etc.
+- **Reasoning tokens**: pass `additional_request_fields={"thinking": {"type": "enabled", "budget_tokens": 4096}}` to enable Claude thinking output.
+- **Structured output**: use `Agent.structured_output()` with Pydantic models; Strands converts schemas to Bedrock tool specs automatically.
+
+## Troubleshooting
+- **Model access errors**: ensure model is enabled in the correct region and that the ID includes the region prefix (`us.` or `eu.`) for inference profiles.
+- **Invalid identifier**: some regions don’t support inference profiles—fall back to standard model IDs (e.g., `anthropic.claude-3-5-sonnet-20241022-v2:0`).
+- **Throughput limitations**: use inference profiles when the error references “on-demand throughput isn’t supported.”
+- **Guardrail debugging**: enable `guardrail_trace="enabled_full"` to obtain detailed violation metadata.

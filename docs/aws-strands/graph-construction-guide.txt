@@ -1,0 +1,940 @@
+# Comprehensive Guide to Graph Construction in AWS Strands
+
+This document provides authoritative guidance on designing, implementing, and deploying multi-node agent graphs using AWS Strands. It synthesizes lessons learned from building production-grade graph systems and clarifies critical architectural decisions.
+
+---
+
+## 1. FOUNDATIONAL CONCEPTS
+
+### 1.1 What Is a Graph in Strands?
+
+A graph is a directed acyclic network (DAG) of nodes where:
+- Each **node** is an independent execution unit (typically an Agent or custom orchestrator).
+- **Edges** define data flow and conditional routing between nodes.
+- The graph **builder** constructs the topology and manages execution semantics.
+- The graph **runtime** orchestrates node invocation, state threading, and error handling.
+
+Key distinction from single-agent loops:
+- Single agents: Linear conversation with recursive tool use within one Agent instance.
+- Graphs: Multiple agents collaborate via state-passing and branching logic.
+
+### 1.2 Critical Limitation: invocation_state is READ-ONLY
+
+**This is the most important architectural principle to understand.**
+
+In AWS Strands, the `invocation_state` passed between nodes:
+- Is managed internally by the graph runtime.
+- Can be read by any node via `invocation_state` parameter in async methods.
+- **CANNOT be modified by nodes and have changes propagated to subsequent nodes.**
+- Any modifications made inside a node are ignored by the runtime.
+
+**Why this matters:**
+If a node modifies `invocation_state` expecting the next node to see those changes, the graph will silently fail to propagate them. This is by design—the framework isolates state mutations and prevents accidental data corruption.
+
+**Solution pattern:**
+Do NOT attempt to update `invocation_state` for cross-node coordination. Instead, use one of these patterns:
+1. **SharedState Pattern** (Recommended): Pass a mutable object instance to all nodes at graph construction time.
+2. **Persistent Storage**: Write to external databases/files and have nodes read back the latest state.
+3. **Return State in MultiAgentResult**: Strands threads this state forward, but it's for logging/output only.
+
+---
+
+## 2. ARCHITECTURE PATTERNS
+
+### 2.1 The SharedState Pattern (Production-Recommended)
+
+**Pattern Definition:**
+Create a Pydantic-validated state class that is instantiated once at graph construction time and passed to every node's `__init__` method. All nodes hold a reference to the same instance and can read/write fields safely.
+
+**Advantages:**
+- ✓ Efficient: In-memory, no serialization overhead.
+- ✓ Type-safe: Pydantic validates all state mutations.
+- ✓ Simple: Clear, predictable semantics for developers.
+- ✓ Observable: Easy to debug by inspecting the shared object.
+- ✓ Works with cyclic graphs: State persists across loop iterations.
+
+**Example Implementation:**
+
+```python
+# models/shared_state.py
+from pydantic import BaseModel
+from typing import Dict, Any
+
+class SharedState(BaseModel):
+    """Shared mutable state for graph coordination."""
+    current_iteration: int = 0
+    max_iterations: int = 1
+    run_id: str = "unknown"
+    run_dir: str = "."
+    nodes_executed: Dict[str, int] = {}
+    custom_data: Dict[str, Any] = {}
+    
+    def increment_iteration(self) -> int:
+        """Increment and return new iteration value."""
+        self.current_iteration += 1
+        return self.current_iteration
+    
+    def get_current_iteration(self) -> int:
+        """Get current iteration without side effects."""
+        return self.current_iteration
+    
+    def record_node_execution(self, node_name: str) -> None:
+        """Track node executions for observability."""
+        if node_name not in self.nodes_executed:
+            self.nodes_executed[node_name] = 0
+        self.nodes_executed[node_name] += 1
+```
+
+**Graph Construction with SharedState:**
+
+```python
+# In your graph builder
+from strands.multiagent import GraphBuilder
+from models import SharedState
+
+builder = GraphBuilder()
+
+# Create shared state instance (once, at graph construction time)
+shared_state = SharedState(
+    max_iterations=config.iterations,
+    run_id=unique_run_id,
+    run_dir=str(output_directory)
+)
+
+# Pass to every node at construction
+node_a = NodeA(shared_state=shared_state, ...)
+node_b = NodeB(shared_state=shared_state, ...)
+node_c = NodeC(shared_state=shared_state, ...)
+
+builder.add_node(node_a, "node_a")
+builder.add_node(node_b, "node_b")
+builder.add_node(node_c, "node_c")
+
+# Edges connect nodes
+builder.add_edge("node_a", "node_b")
+builder.add_edge("node_b", "node_c")
+
+graph = builder.build()
+```
+
+**Inside Nodes:**
+
+```python
+class MyNode(BaseNode):
+    def __init__(self, shared_state: SharedState, ...):
+        self.shared_state = shared_state
+        # All nodes now access the same shared_state instance
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Read from shared state
+        iteration = self.shared_state.get_current_iteration()
+        
+        # Do work...
+        
+        # Write to shared state
+        self.shared_state.increment_iteration()
+        self.shared_state.record_node_execution(self.name)
+```
+
+---
+
+### 2.2 Persistent Storage Pattern
+
+**When to use:**
+- Graphs with long-running node execution (hours/days).
+- Distributed graph deployments across multiple machines.
+- State must survive process crashes.
+- Integration with external orchestrators.
+
+**Implementation:**
+
+```python
+class PersistentStateManager:
+    """Thread-safe state persistence to database or S3."""
+    
+    def __init__(self, backend_type: str = "dynamodb"):
+        self.backend = self._init_backend(backend_type)
+    
+    def read_state(self, key: str) -> Dict:
+        """Read current state from persistent store."""
+        return self.backend.get(key)
+    
+    def write_state(self, key: str, state: Dict) -> None:
+        """Write state atomically to persistent store."""
+        self.backend.put(key, state, conditional=True)
+    
+    def increment_counter(self, key: str, counter_name: str) -> int:
+        """Atomic increment operation."""
+        return self.backend.increment(key, counter_name)
+```
+
+**Tradeoffs:**
+- ✗ Slower: Network/disk I/O adds latency.
+- ✗ Complexity: Requires consistency handling, retries, eventual consistency semantics.
+- ✓ Durable: Survives process restarts.
+- ✓ Distributed: Multiple graph instances can coordinate.
+
+---
+
+### 2.3 Return Value Pattern (Anti-Pattern for Shared State)
+
+**Why this is NOT recommended for cross-node coordination:**
+
+```python
+# DON'T DO THIS FOR SHARED STATE
+async def invoke_async(self, task, invocation_state=None, **kwargs):
+    # Strands forwards invocation_state, but node modifications aren't propagated
+    invocation_state['iteration'] = invocation_state.get('iteration', 0) + 1
+    return self.create_result(message="...", state=invocation_state)
+    # ^^^ The increment is silently lost by the framework
+```
+
+**What works with return values:**
+- Logging/output purposes: state in result is displayed but not used for graph decisions.
+- One-directional data: Child nodes reading parent output.
+- Not for control flow: Don't use state updates to drive conditional edges.
+
+---
+
+## 3. DESIGNING GRAPH TOPOLOGY
+
+### 3.1 Linear Chains
+
+**Pattern:** Node A → B → C → ... → Z
+
+**Use case:** Sequential processing pipelines, clear execution order.
+
+```python
+builder.set_entry_point("node_a")
+builder.add_edge("node_a", "node_b")
+builder.add_edge("node_b", "node_c")
+# ... etc
+```
+
+**Pros:** Simple, deterministic, easy to debug.
+**Cons:** No parallelization, no adaptability.
+
+---
+
+### 3.2 Loops with Iteration Control
+
+**Pattern:** Controller (condition check) → Payload nodes → back to controller.
+
+**Critical requirements:**
+- The **iteration counter must NOT be stored in invocation_state**.
+- Use SharedState to track loop progress.
+- Condition functions check SharedState, not invocation_state.
+
+**Implementation:**
+
+```python
+# Create shared state for loop tracking
+shared_state = SharedState(max_iterations=3)
+
+# Create iteration controller node
+controller = IterationControllerNode(shared_state=shared_state)
+
+# Condition functions READ from shared_state
+def should_continue(state):
+    # Access shared_state via the controller node
+    return controller.shared_state.get_current_iteration() < controller.shared_state.max_iterations
+
+def is_complete(state):
+    return controller.shared_state.get_current_iteration() >= controller.shared_state.max_iterations
+
+# Build the loop
+builder.set_entry_point("controller")
+builder.add_edge("controller", "payload_node", condition=should_continue)
+builder.add_edge("controller", "final_step", condition=is_complete)
+builder.add_edge("payload_node", "controller")  # Loop back
+
+# Configure graph to handle cycles
+builder.set_max_node_executions(config.iterations * num_nodes + 10)
+builder.reset_on_revisit(False)  # Keep state across loop iterations
+```
+
+**Key insight:** The condition function receives the **graph execution state**, not a single node result. Use it to inspect completed node results and decide routing.
+
+---
+
+### 3.3 Branching with Conditional Edges
+
+**Pattern:** Node A → (condition) → B or C
+
+**Implementation:**
+
+```python
+def route_high_confidence(state):
+    """Route to high-confidence branch if score > 0.8."""
+    result = state.results.get("classifier_node")
+    if not result:
+        return False
+    try:
+        score = result.result.confidence_score
+        return score > 0.8
+    except (AttributeError, KeyError):
+        return False
+
+def route_low_confidence(state):
+    """Route to verification branch if score <= 0.8."""
+    return not route_high_confidence(state)
+
+builder.add_edge("classifier", "fast_path", condition=route_high_confidence)
+builder.add_edge("classifier", "verify_path", condition=route_low_confidence)
+```
+
+**Best practices:**
+- Condition functions should be pure (no side effects).
+- Return boolean deterministically based on state.results.
+- Handle missing/malformed results gracefully.
+- Test condition functions independently.
+
+---
+
+### 3.4 Parallel Branches with Convergence
+
+**Pattern:** Node A → (B and C in parallel) → D (convergence).
+
+**Important caveat:** AWS Strands processes nodes sequentially by default. For true parallelism, use:
+
+```python
+# Option 1: Use built-in parallel routing (if available in your Strands version)
+builder.add_edges_parallel(
+    "node_a",
+    ["node_b", "node_c"],
+    condition=all_succeeded  # Convergence condition
+)
+
+# Option 2: Manual sequential with independent paths
+builder.add_edge("node_a", "node_b")
+builder.add_edge("node_a", "node_c")  # Also from A
+builder.add_edge("node_b", "node_d")
+builder.add_edge("node_c", "node_d")
+
+# Convergence requires all predecessors to complete
+builder.set_convergence("node_d", require_all=True)
+```
+
+**Shared state considerations for parallelism:**
+- If nodes B and C modify shared_state, use locking.
+- If states are independent, mark fields as thread-local.
+
+---
+
+### 3.5 Fan-Out / Fan-In Patterns
+
+**Pattern:** One source node distributes work to many workers, then aggregates.
+
+```python
+# Fan-out: Processor node creates multiple independent tasks
+shared_state = SharedState()
+
+processor = ProcessorNode(shared_state=shared_state)
+builder.add_node(processor, "processor")
+
+# Create N worker nodes (dynamically or statically)
+for i in range(num_workers):
+    worker = WorkerNode(shared_state=shared_state, worker_id=i)
+    builder.add_node(worker, f"worker_{i}")
+    builder.add_edge("processor", f"worker_{i}")  # Fan-out
+    builder.add_edge(f"worker_{i}", "aggregator")  # Fan-in
+
+aggregator = AggregatorNode(shared_state=shared_state)
+builder.add_node(aggregator, "aggregator")
+```
+
+---
+
+## 4. IMPLEMENTING NODES FOR GRAPH USE
+
+### 4.1 Node Interface Requirements
+
+Every node must implement:
+
+```python
+from strands.multiagent import MultiAgentResult
+from typing import Optional, Union
+from strands.types.content import ContentBlock
+
+class MyNode(BaseNode):
+    def __init__(self, shared_state: SharedState, **kwargs):
+        """Initialize with shared state reference."""
+        self.shared_state = shared_state
+    
+    async def invoke_async(
+        self,
+        task: Union[str, list[ContentBlock]],
+        invocation_state: Optional[dict] = None,
+        **kwargs
+    ) -> MultiAgentResult:
+        """Execute node logic and return typed result."""
+        # invocation_state is READ-ONLY; don't modify it for state threading
+        # Use self.shared_state for coordination instead
+        
+        # Do work...
+        
+        return self.create_result(
+            message="...",
+            state=updated_state,  # For output/logging only
+            execution_time=elapsed_ms
+        )
+```
+
+### 4.2 State Management Inside Nodes
+
+**Pattern 1: Read from shared_state**
+
+```python
+async def invoke_async(self, task, invocation_state=None, **kwargs):
+    # Safe: Reading shared state
+    iteration = self.shared_state.get_current_iteration()
+    max_iters = self.shared_state.max_iterations
+    
+    if iteration >= max_iters:
+        return self.create_result(message="Max iterations reached", state=...)
+```
+
+**Pattern 2: Write to shared_state**
+
+```python
+async def invoke_async(self, task, invocation_state=None, **kwargs):
+    # Increment shared counter
+    self.shared_state.increment_iteration()
+    
+    # Record custom data
+    self.shared_state.custom_data['last_processed'] = task
+    
+    # Never modify invocation_state expecting it to propagate
+    # invocation_state is read-only for thread safety
+```
+
+**Pattern 3: Typed ExecutionState for output**
+
+```python
+async def invoke_async(self, task, invocation_state=None, **kwargs):
+    # Parse typed input (extract original prompt, etc.)
+    node_input = self._get_typed_input(task, invocation_state)
+    state = node_input.state  # This is the typed ExecutionState
+    
+    # Update with this node's output (for logging/output, not for propagation)
+    updated_state = state.with_updates(
+        iteration=self.shared_state.get_current_iteration(),
+        some_field="new_value",
+        success=True
+    )
+    
+    return self.create_result(message="...", state=updated_state)
+```
+
+### 4.3 Error Handling in Graph Nodes
+
+```python
+async def invoke_async(self, task, invocation_state=None, **kwargs):
+    try:
+        # Do work
+        result = await some_operation()
+        return self.create_result(message=str(result), state=...)
+    
+    except SpecificError as e:
+        # Update shared state to track failure
+        self.shared_state.custom_data['last_error'] = str(e)
+        
+        # Return error result (don't raise; let framework handle it)
+        error_state = ExecutionState(
+            original_prompt=...,
+            success=False,
+            error_message=str(e)
+        )
+        return self.handle_error(e, error_state)
+    
+    except Exception as e:
+        # Unexpected error; log and return error result
+        logger.exception(f"Unexpected error in {self.name}: {e}")
+        return self.handle_error(e, error_state)
+```
+
+---
+
+## 5. CONDITION FUNCTIONS FOR ROUTING
+
+Condition functions are critical for graph control flow. They must be:
+- **Pure**: No side effects, deterministic output.
+- **Fast**: Called on every execution attempt.
+- **Defensive**: Handle missing/malformed state gracefully.
+
+### 5.1 Anatomy of a Condition Function
+
+```python
+def should_continue(state):
+    """
+    Route decision function for graph conditional edges.
+    
+    Args:
+        state: Current graph execution state containing results of completed nodes.
+    
+    Returns:
+        bool: True to take this edge, False otherwise.
+    """
+    # Inspect the previous node's result
+    previous_result = state.results.get("previous_node_name")
+    if not previous_result:
+        # Previous node hasn't completed yet
+        return False
+    
+    try:
+        # Extract data from result (structure depends on your node implementation)
+        result_obj = previous_result.result
+        
+        # Make decision
+        if hasattr(result_obj, 'data') and result_obj.data['iterations_remaining'] > 0:
+            return True
+        else:
+            return False
+    
+    except (AttributeError, KeyError, TypeError):
+        # Handle gracefully if structure is unexpected
+        logger.warning(f"Could not parse result from previous_node_name")
+        return False
+```
+
+### 5.2 Common Condition Patterns
+
+**Check a threshold:**
+```python
+def above_confidence_threshold(state):
+    result = state.results.get("classifier")
+    if not result:
+        return False
+    return float(result.result.confidence) > 0.75
+```
+
+**Check multiple prerequisites:**
+```python
+def all_prerequisites_met(state):
+    reqs = ["auth_check", "validation", "preprocessing"]
+    for req in reqs:
+        if req not in state.results:
+            return False
+        if not state.results[req].result.success:
+            return False
+    return True
+```
+
+**Iterate with shared state:**
+```python
+def should_continue_loop(state):
+    # Access shared_state via closure (defined at graph construction time)
+    return shared_state.get_current_iteration() < shared_state.max_iterations
+```
+
+---
+
+## 6. EXECUTION SEMANTICS
+
+### 6.1 Node Execution Order
+
+**AWS Strands execution model:**
+1. Start with entry point node.
+2. Execute node to completion; collect result.
+3. Evaluate all outgoing conditional edges.
+4. Route to next node(s) based on conditions.
+5. Repeat until no more edges or max executions reached.
+
+**Important:** Nodes are executed sequentially unless the graph builder supports explicit parallelism.
+
+### 6.2 Execution Settings
+
+```python
+# Configure graph execution limits
+builder.set_max_node_executions(max_executions=100)
+builder.set_execution_timeout(timeout_seconds=600)
+
+# For cyclic graphs
+builder.reset_on_revisit(False)  # Keep state across re-visits
+builder.set_max_revisits(per_node=5)  # Prevent infinite loops
+
+graph = builder.build()
+```
+
+### 6.3 Handling Cycles and Iterations
+
+**Key principle:** If a node is executed multiple times (in a loop), each execution starts fresh BUT can access SharedState which persists across executions.
+
+```python
+# Example: Loop that should run 3 times
+shared_state = SharedState(max_iterations=3)
+
+class LoopPayloadNode(BaseNode):
+    def __init__(self, shared_state: SharedState):
+        self.shared_state = shared_state
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # First execution: iteration = 0
+        # Second execution: iteration = 1
+        # Third execution: iteration = 2
+        current = self.shared_state.get_current_iteration()
+        
+        # Process based on iteration
+        result = self._process_iteration(task, current)
+        
+        # DO NOT try to update invocation_state['iteration']
+        # Instead, increment the shared state
+        self.shared_state.increment_iteration()
+        
+        return self.create_result(message=str(result), state=...)
+
+# Controller node that decides when to stop
+class ControllerNode(BaseNode):
+    def __init__(self, shared_state: SharedState):
+        self.shared_state = shared_state
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        iteration = self.shared_state.get_current_iteration()
+        max_iter = self.shared_state.max_iterations
+        
+        should_continue = iteration < max_iter
+        
+        msg = f"Iteration {iteration}/{max_iter}"
+        if not should_continue:
+            msg += " - All iterations complete"
+        
+        state = ExecutionState(
+            iteration=iteration,
+            should_continue=should_continue,
+            success=True
+        )
+        return self.create_result(message=msg, state=state)
+
+# Wire the graph
+shared_state = SharedState(max_iterations=3)
+
+controller = ControllerNode(shared_state=shared_state)
+payload = LoopPayloadNode(shared_state=shared_state)
+final = FinalNode(shared_state=shared_state)
+
+builder.set_entry_point("controller")
+builder.add_edge("controller", "payload", condition=lambda s: should_continue(s))
+builder.add_edge("controller", "final", condition=lambda s: not should_continue(s))
+builder.add_edge("payload", "controller")  # Loop back
+
+builder.set_max_node_executions(20)  # 3 iterations * 2 nodes + buffer
+builder.reset_on_revisit(False)
+```
+
+---
+
+## 7. OBSERVABILITY IN GRAPHS
+
+### 7.1 Instrumentation Points
+
+**Before execution:**
+```python
+async def invoke_async(self, task, invocation_state=None, **kwargs):
+    logger.info(f"Node {self.name} starting | Iteration: {self.shared_state.get_current_iteration()}")
+    start_time = time.time()
+```
+
+**During execution:**
+```python
+    result = await some_operation()
+    logger.info(f"Operation completed: {result}")
+```
+
+**After execution:**
+```python
+    elapsed = int(time.time() - start_time)
+    logger.info(f"Node {self.name} completed in {elapsed}ms")
+    
+    # Record to shared state for centralized observability
+    self.shared_state.record_node_execution(self.name)
+```
+
+### 7.2 Centralized Metrics
+
+```python
+# In shared_state after graph completes
+for node_name, exec_count in shared_state.nodes_executed.items():
+    print(f"{node_name}: {exec_count} executions")
+
+# Example output:
+# controller: 4 executions
+# payload: 3 executions
+# final: 1 execution
+```
+
+### 7.3 Condition Function Debugging
+
+```python
+def should_continue_with_logging(state):
+    result = state.results.get("controller")
+    if not result:
+        logger.debug("Controller result not available yet")
+        return False
+    
+    try:
+        should_cont = result.result.should_continue
+        logger.debug(f"Routing decision: should_continue={should_cont}")
+        return should_cont
+    except Exception as e:
+        logger.warning(f"Error in routing condition: {e}")
+        return False
+```
+
+---
+
+## 8. COMMON MISTAKES AND HOW TO AVOID THEM
+
+### Mistake 1: Trying to Modify invocation_state
+
+**Wrong:**
+```python
+async def invoke_async(self, task, invocation_state=None, **kwargs):
+    invocation_state['iteration'] = invocation_state.get('iteration', 0) + 1
+    # ^^^ This modification is LOST; framework ignores it
+```
+
+**Right:**
+```python
+async def invoke_async(self, task, invocation_state=None, **kwargs):
+    self.shared_state.increment_iteration()  # Use shared state
+```
+
+---
+
+### Mistake 2: Relying on invocation_state for Loop Control
+
+**Wrong:**
+```python
+def should_continue(state):
+    # This will always see the original invocation_state
+    return state.invocation_state['iteration'] < max_iter
+    # ^^^ Will never increment because nodes can't modify it
+```
+
+**Right:**
+```python
+def should_continue(state):
+    # invocation_state is passed for reference, but use shared_state for tracking
+    return shared_state.get_current_iteration() < shared_state.max_iterations
+```
+
+---
+
+### Mistake 3: Not Setting max_node_executions for Cycles
+
+**Wrong:**
+```python
+builder.add_edge("node_a", "node_b")
+builder.add_edge("node_b", "node_a")  # Cycle!
+# ^^^ Without max_node_executions limit, this could run forever
+graph = builder.build()
+```
+
+**Right:**
+```python
+builder.set_max_node_executions(num_iterations * nodes_per_iteration + buffer)
+builder.add_edge("node_a", "node_b")
+builder.add_edge("node_b", "node_a")
+graph = builder.build()
+```
+
+---
+
+### Mistake 4: Complex State Logic in Condition Functions
+
+**Wrong:**
+```python
+def route(state):
+    # Complex logic, side effects, network calls = BAD
+    data = fetch_data_from_api()  # Slow, not idempotent
+    result = state.results.get("prev")
+    return len(result) > len(data)
+```
+
+**Right:**
+```python
+def route(state):
+    # Simple, pure logic
+    result = state.results.get("prev")
+    return result and result.result.count > 10
+```
+
+---
+
+### Mistake 5: Assuming State Persists Across Graph Runs
+
+**Wrong:**
+```python
+# Run 1
+graph.run("prompt 1")
+
+# Run 2 - shared_state was modified in Run 1
+graph.run("prompt 2")  # State carries over from Run 1!
+```
+
+**Right:**
+```python
+# Create fresh shared_state for each graph execution
+def run_creativity_flow(prompt):
+    shared_state = SharedState(max_iterations=3)  # Fresh state
+    # ... build and run graph with this shared_state
+    return result
+
+# Each invocation is isolated
+run_creativity_flow("prompt 1")
+run_creativity_flow("prompt 2")
+```
+
+---
+
+## 9. PRODUCTION CHECKLIST
+
+Before deploying a graph to production:
+
+- [ ] **State Management**: All cross-node state uses SharedState (not invocation_state).
+- [ ] **Loop Control**: Iteration control uses SharedState, not invocation_state.
+- [ ] **Condition Functions**: Pure, defensive, tested independently.
+- [ ] **Error Handling**: All nodes have try/except; errors are logged and recorded in SharedState.
+- [ ] **Execution Limits**: max_node_executions is set appropriately for graph topology.
+- [ ] **Observability**: All nodes log execution milestones and record metrics.
+- [ ] **Testing**: Mock graph execution with various iteration counts and edge cases.
+- [ ] **Documentation**: Each node has docstring explaining inputs, side effects, outputs.
+- [ ] **Performance**: Time all nodes; identify and optimize bottlenecks.
+- [ ] **State Isolation**: Each graph run gets fresh SharedState instance.
+
+---
+
+## 10. ADVANCED PATTERNS
+
+### 10.1 Dynamic Node Generation
+
+```python
+def create_graph_with_dynamic_workers(num_workers: int):
+    builder = GraphBuilder()
+    shared_state = SharedState()
+    
+    coordinator = CoordinatorNode(shared_state=shared_state)
+    builder.add_node(coordinator, "coordinator")
+    builder.set_entry_point("coordinator")
+    
+    # Dynamically create worker nodes
+    for i in range(num_workers):
+        worker = WorkerNode(shared_state=shared_state, worker_id=i)
+        builder.add_node(worker, f"worker_{i}")
+        builder.add_edge("coordinator", f"worker_{i}")
+        builder.add_edge(f"worker_{i}", "aggregator")
+    
+    aggregator = AggregatorNode(shared_state=shared_state)
+    builder.add_node(aggregator, "aggregator")
+    
+    return builder.build()
+```
+
+### 10.2 Recursive Graph Structures
+
+If you need recursive behavior (graph calling itself), use shared_state to track depth:
+
+```python
+class RecursiveNode(BaseNode):
+    def __init__(self, shared_state: SharedState, max_depth: int = 5):
+        self.shared_state = shared_state
+        self.max_depth = max_depth
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        depth = self.shared_state.custom_data.get('recursion_depth', 0)
+        
+        if depth >= self.max_depth:
+            return self.create_result(message="Max depth reached", state=...)
+        
+        # Increment depth
+        self.shared_state.custom_data['recursion_depth'] = depth + 1
+        
+        # Do recursive work...
+        
+        # Decrement before returning
+        self.shared_state.custom_data['recursion_depth'] = depth
+```
+
+### 10.3 Graph Composition (Graph of Graphs)
+
+```python
+# Create a sub-graph
+def build_subgraph(shared_state: SharedState):
+    builder = GraphBuilder()
+    node_a = NodeA(shared_state=shared_state)
+    node_b = NodeB(shared_state=shared_state)
+    builder.add_node(node_a, "a")
+    builder.add_node(node_b, "b")
+    builder.add_edge("a", "b")
+    return builder.build()
+
+# Wrap the sub-graph in a super-node
+class SubgraphNode(BaseNode):
+    def __init__(self, shared_state: SharedState, subgraph):
+        self.shared_state = shared_state
+        self.subgraph = subgraph
+    
+    async def invoke_async(self, task, invocation_state=None, **kwargs):
+        # Execute the sub-graph
+        result = self.subgraph.run(task)
+        return self.create_result(message=str(result), state=...)
+
+# Build main graph
+shared_state = SharedState()
+subgraph = build_subgraph(shared_state)
+super_node = SubgraphNode(shared_state=shared_state, subgraph=subgraph)
+# ... continue building main graph
+```
+
+---
+
+## 11. TROUBLESHOOTING
+
+### Problem: Iteration stuck at 0
+
+**Cause:** Trying to update invocation_state['iteration'].
+
+**Solution:** Switch to SharedState.increment_iteration().
+
+### Problem: Condition function never returns True
+
+**Cause:** Condition function inspects old state, condition is logically impossible.
+
+**Solution:**
+- Log the condition function with intermediate values.
+- Inspect state.results structure to understand what data is available.
+- Simplify condition logic.
+
+### Problem: Graph hangs or runs too long
+
+**Cause:** Infinite loop due to missing max_node_executions or reset_on_revisit(True).
+
+**Solution:**
+```python
+builder.set_max_node_executions(limit)
+builder.reset_on_revisit(False)  # Don't reset state on revisit
+```
+
+### Problem: Shared state changes don't take effect
+
+**Cause:** Nodes are reading cached/stale values.
+
+**Solution:** Always call methods (e.g., `get_current_iteration()`) instead of caching field values.
+
+---
+
+## 12. REFERENCES AND FURTHER READING
+
+- **AWS Strands Agent Loop Mechanics**: Understanding the single-agent event loop.
+- **AWS Strands Quickstart**: Basic agent and graph examples.
+- **Amazon Bedrock Model Provider**: Configuration and capabilities.
+- **Observability Foundations**: Instrumentation and monitoring patterns.
+- **Production Operations**: Deployment and scaling considerations.
+
+---
+
+## Conclusion
+
+Graph construction in AWS Strands requires a clear mental model of state threading, conditional routing, and node execution semantics. The key insight is that **invocation_state is read-only and cannot be modified for propagation**. Use **SharedState** as your coordination layer, design **pure condition functions** for routing logic, and **instrument heavily** for observability. Follow this guide and you'll build robust, maintainable multi-agent systems.
+
+Good luck building!
